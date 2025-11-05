@@ -1,8 +1,7 @@
 import os
 import logging
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-from supabase import create_client
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 from config.matrix import (
     TRANSFORMER_TYPES,
@@ -13,21 +12,14 @@ from config.matrix import (
     is_product_number_required,
     validate_selection
 )
+from database import db
 
 # Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
-
-# Состояния для ConversationHandler
-SELECTING_WORKSHOP, CREATING_REQUEST = range(2)
-
-# Инициализация Supabase
-supabase_url = os.getenv('SUPABASE_URL')
-supabase_key = os.getenv('SUPABASE_KEY')
-supabase = create_client(supabase_url, supabase_key) if supabase_url and supabase_key else None
+logger = logging.getLogger.getLogger(__name__)
 
 class FactoryBot:
     def __init__(self, token: str):
@@ -40,10 +32,15 @@ class FactoryBot:
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(MessageHandler(filters.Text(["📋 Мои заявки"]), self.show_my_requests))
         self.application.add_handler(MessageHandler(filters.Text(["➕ Новая заявка"]), self.start_new_request))
+        self.application.add_handler(MessageHandler(filters.Text(["❌ Отмена"]), self.cancel_request))
+        
+        # Обработчики создания заявки
+        self.application.add_handler(MessageHandler(filters.Text(list(TRANSFORMER_TYPES.values())), self.handle_transformer_selection))
+        self.application.add_handler(MessageHandler(filters.Text(list(WORKSHOPS.values())), self.handle_workshop_selection_request))
+        self.application.add_handler(MessageHandler(filters.Text(list(PRODUCTS.values())), self.handle_product_selection))
         
         # Обработчик выбора участка при регистрации
-        workshop_keys = list(WORKSHOPS.values())
-        self.application.add_handler(MessageHandler(filters.Text(workshop_keys), self.handle_workshop_selection))
+        self.application.add_handler(MessageHandler(filters.Text(list(WORKSHOPS.values())), self.handle_workshop_selection))
         
         # Обработчик неизвестных сообщений
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
@@ -65,20 +62,19 @@ class FactoryBot:
         )
     
     async def handle_workshop_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик выбора участка"""
+        """Обработчик выбора участка при регистрации"""
         workshop = update.message.text
         user = update.effective_user
         
         try:
             # Сохраняем пользователя в БД
-            if supabase:
-                user_data = {
-                    'telegram_id': user.id,
-                    'username': user.username,
-                    'full_name': user.full_name,
-                    'workshop': workshop
-                }
-                supabase.table('users').upsert(user_data).execute()
+            user_data = {
+                'telegram_id': user.id,
+                'username': user.username,
+                'full_name': user.full_name,
+                'workshop': workshop
+            }
+            db.create_user(user_data)
             
             logger.info(f"User {user.id} registered for workshop {workshop}")
             
@@ -105,6 +101,7 @@ class FactoryBot:
         """Начало создания новой заявки"""
         # Создаем клавиатуру с типами трансформаторов
         transformer_buttons = [[KeyboardButton(t_type)] for t_type in TRANSFORMER_TYPES.values()]
+        transformer_buttons.append(["❌ Отмена"])
         reply_markup = ReplyKeyboardMarkup(transformer_buttons, resize_keyboard=True, one_time_keyboard=True)
         
         await update.message.reply_text(
@@ -113,31 +110,139 @@ class FactoryBot:
             reply_markup=reply_markup
         )
     
+    async def handle_transformer_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик выбора типа трансформатора"""
+        transformer_type_name = update.message.text
+        user = update.effective_user
+        
+        # Находим ключ типа по названию
+        transformer_type = next(key for key, value in TRANSFORMER_TYPES.items() if value == transformer_type_name)
+        
+        # Получаем доступные участки для этого типа
+        available_workshops = get_workshops_for_transformer(transformer_type)
+        workshop_buttons = [[KeyboardButton(WORKSHOPS[ws])] for ws in available_workshops]
+        workshop_buttons.append(["❌ Отмена"])
+        
+        reply_markup = ReplyKeyboardMarkup(workshop_buttons, resize_keyboard=True, one_time_keyboard=True)
+        
+        # Сохраняем в сессию
+        db.save_session({
+            'telegram_id': user.id,
+            'transformer_type': transformer_type,
+            'current_step': 'selecting_workshop'
+        })
+        
+        await update.message.reply_text(
+            f"✅ Выбран тип: {transformer_type_name}\n\n"
+            f"Теперь выбери участок:",
+            reply_markup=reply_markup
+        )
+    
+    async def handle_workshop_selection_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик выбора участка при создании заявки"""
+        workshop_name = update.message.text
+        user = update.effective_user
+        
+        # Получаем сессию пользователя
+        session_response = db.get_session(user.id)
+        if not session_response.data:
+            await update.message.reply_text("❌ Сессия устарела. Начни заново.")
+            return
+        
+        session = session_response.data[0]
+        transformer_type = session['transformer_type']
+        
+        # Находим ключ участка по названию
+        workshop = next(key for key, value in WORKSHOPS.items() if value == workshop_name)
+        
+        # Получаем доступные изделия для этого участка
+        available_products = get_products_for_workshop(workshop)
+        product_buttons = [[KeyboardButton(PRODUCTS[prod])] for prod in available_products]
+        product_buttons.append(["❌ Отмена"])
+        
+        reply_markup = ReplyKeyboardMarkup(product_buttons, resize_keyboard=True, one_time_keyboard=True)
+        
+        # Обновляем сессию
+        db.save_session({
+            'telegram_id': user.id,
+            'transformer_type': transformer_type,
+            'workshop': workshop,
+            'current_step': 'selecting_product'
+        })
+        
+        await update.message.reply_text(
+            f"✅ Выбран участок: {workshop_name}\n\n"
+            f"Теперь выбери изделие:",
+            reply_markup=reply_markup
+        )
+    
+    async def handle_product_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик выбора изделия"""
+        product_name = update.message.text
+        user = update.effective_user
+        
+        # Получаем сессию пользователя
+        session_response = db.get_session(user.id)
+        if not session_response.data:
+            await update.message.reply_text("❌ Сессия устарела. Начни заново.")
+            return
+        
+        session = session_response.data[0]
+        
+        # Находим ключ изделия по названию
+        product = next(key for key, value in PRODUCTS.items() if value == product_name)
+        
+        # Обновляем сессию
+        db.save_session({
+            'telegram_id': user.id,
+            'transformer_type': session['transformer_type'],
+            'workshop': session['workshop'],
+            'product_type': product,
+            'current_step': 'entering_drawing_number'
+        })
+        
+        # Проверяем, требуется ли номер изделия
+        requires_number = is_product_number_required(product)
+        number_text = "и номер изделия" if requires_number else ""
+        
+        await update.message.reply_text(
+            f"✅ Выбрано изделие: {product_name}\n\n"
+            f"Теперь введи номер чертежа {number_text}.\n\n"
+            f"Сначала введи номер чертежа:",
+            reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True)
+        )
+    
+    async def cancel_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Отмена создания заявки"""
+        user = update.effective_user
+        db.delete_session(user.id)
+        
+        main_keyboard = ReplyKeyboardMarkup([
+            ["📋 Мои заявки", "➕ Новая заявка"],
+            ["⚠️ Несоответствия", "📊 Статистика"]
+        ], resize_keyboard=True)
+        
+        await update.message.reply_text(
+            "❌ Создание заявки отменено.",
+            reply_markup=main_keyboard
+        )
+    
     async def show_my_requests(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать заявки пользователя"""
         user = update.effective_user
         
         try:
-            if supabase:
-                # Получаем пользователя
-                user_response = supabase.table('users').select('*').eq('telegram_id', user.id).execute()
-                if not user_response.data:
-                    await update.message.reply_text("Сначала зарегистрируйся через /start")
-                    return
-                
-                current_user = user_response.data[0]
-                
-                # Получаем заявки пользователя
-                requests_response = supabase.table('requests')\
-                    .select('*')\
-                    .eq('master_id', current_user['id'])\
-                    .order('created_at', desc=True)\
-                    .limit(5)\
-                    .execute()
-                
-                requests = requests_response.data
-            else:
-                requests = []
+            # Получаем пользователя
+            user_response = db.get_user_by_telegram_id(user.id)
+            if not user_response.data:
+                await update.message.reply_text("Сначала зарегистрируйся через /start")
+                return
+            
+            current_user = user_response.data[0]
+            
+            # Получаем заявки пользователя
+            requests_response = db.get_user_requests(current_user['id'], limit=5)
+            requests = requests_response.data
             
             if not requests:
                 await update.message.reply_text(
@@ -172,25 +277,125 @@ class FactoryBot:
             "*/start* - начать работу с ботом\n"
             "*/help* - показать эту справку\n"
             "📋 *Мои заявки* - посмотреть свои заявки\n"
-            "➕ *Новая заявка* - создать заявку на приемку\n\n"
-            "Для создания заявки выбери:\n"
-            "1. Тип трансформатора\n"
-            "2. Участок\n" 
-            "3. Изделие\n"
+            "➕ *Новая заявка* - создать заявку на приемку\n"
+            "❌ *Отмена* - отменить создание заявки\n\n"
+            "*Процесс создания заявки:*\n"
+            "1. Выбери тип трансформатора\n"
+            "2. Выбери участок\n" 
+            "3. Выбери изделие\n"
             "4. Введи данные\n"
         )
         await update.message.reply_text(help_text, parse_mode='Markdown')
     
     async def handle_unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик неизвестных сообщений"""
-        await update.message.reply_text(
-            "Я пока понимаю только основные команды 😊\n\n"
-            "Используй кнопки ниже для навигации:",
-            reply_markup=ReplyKeyboardMarkup([
+        # Проверяем, не находится ли пользователь в процессе создания заявки
+        user = update.effective_user
+        session_response = db.get_session(user.id)
+        
+        if session_response.data:
+            session = session_response.data[0]
+            current_step = session.get('current_step')
+            
+            if current_step == 'entering_drawing_number':
+                # Пользователь вводит номер чертежа
+                drawing_number = update.message.text
+                
+                # Обновляем сессию
+                db.save_session({
+                    'telegram_id': user.id,
+                    'transformer_type': session['transformer_type'],
+                    'workshop': session['workshop'],
+                    'product_type': session['product_type'],
+                    'drawing_number': drawing_number,
+                    'current_step': 'entering_product_number'
+                })
+                
+                requires_number = is_product_number_required(session['product_type'])
+                
+                if requires_number:
+                    await update.message.reply_text(
+                        f"✅ Номер чертежа: {drawing_number}\n\n"
+                        f"Теперь введи номер изделия:",
+                        reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True)
+                    )
+                else:
+                    # Создаем заявку без номера изделия
+                    await self.finalize_request(update, user, session, drawing_number, None)
+                
+            elif current_step == 'entering_product_number':
+                # Пользователь вводит номер изделия
+                product_number = update.message.text
+                drawing_number = session['drawing_number']
+                
+                # Создаем заявку
+                await self.finalize_request(update, user, session, drawing_number, product_number)
+                
+        else:
+            await update.message.reply_text(
+                "Я пока понимаю только основные команды 😊\n\n"
+                "Используй кнопки ниже для навигации:",
+                reply_markup=ReplyKeyboardMarkup([
+                    ["📋 Мои заявки", "➕ Новая заявка"],
+                    ["⚠️ Несоответствия", "📊 Статистика"]
+                ], resize_keyboard=True)
+            )
+    
+    async def finalize_request(self, update: Update, user, session, drawing_number: str, product_number: str):
+        """Завершение создания заявки"""
+        try:
+            # Получаем пользователя
+            user_response = db.get_user_by_telegram_id(user.id)
+            if not user_response.data:
+                await update.message.reply_text("❌ Пользователь не найден")
+                return
+            
+            current_user = user_response.data[0]
+            
+            # Создаем заявку
+            request_data = {
+                'transformer_type': session['transformer_type'],
+                'workshop': session['workshop'],
+                'product_type': session['product_type'],
+                'drawing_number': drawing_number,
+                'product_number': product_number,
+                'master_id': current_user['id'],
+                'status': 'planned'
+            }
+            
+            db.create_request(request_data)
+            
+            # Очищаем сессию
+            db.delete_session(user.id)
+            
+            # Основная клавиатура
+            main_keyboard = ReplyKeyboardMarkup([
                 ["📋 Мои заявки", "➕ Новая заявка"],
                 ["⚠️ Несоответствия", "📊 Статистика"]
             ], resize_keyboard=True)
-        )
+            
+            product_name = PRODUCTS[session['product_type']]
+            workshop_name = WORKSHOPS[session['workshop']]
+            transformer_name = TRANSFORMER_TYPES[session['transformer_type']]
+            
+            await update.message.reply_text(
+                f"✅ *Заявка создана!*\n\n"
+                f"*Тип:* {transformer_name}\n"
+                f"*Участок:* {workshop_name}\n"
+                f"*Изделие:* {product_name}\n"
+                f"*Чертеж:* {drawing_number}\n"
+                f"*Номер изделия:* {product_number or 'Б/н'}\n"
+                f"*Статус:* 🟡 Планируется\n\n"
+                f"Заявка отправлена в ОТК для приемки.",
+                parse_mode='Markdown',
+                reply_markup=main_keyboard
+            )
+            
+            logger.info(f"Request created for user {user.id}")
+            
+        except Exception as e:
+            logger.error(f"Error creating request: {e}")
+            await update.message.reply_text("❌ Ошибка при создании заявки")
     
     def run(self):
         """Запуск бота"""
